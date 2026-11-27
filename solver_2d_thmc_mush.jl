@@ -2,9 +2,12 @@
 # 2D Staggered-Grid Coupled THMC Two-Phase Flow Solver (ParallelStencil.jl, CPU)
 # ------------------------------------------------------------------------------
 # Uses the Pseudo-Maxwell Viscoelastic Symplectic PT Stokes-Darcy formulation
-# (Räss et al. 2022, GMD) with 3D plane-strain deviatoric stresses, implicit
-# compaction update on Pt, and 2nd-order damped-wave elliptic solver on Pf for
-# O(N) convergence across extreme solid-viscosity and melt-mobility contrasts.
+# (Räss et al. 2022, GMD) with:
+#   - 3D plane-strain deviatoric stresses + log-space viscoplastic relaxation
+#   - Shear-enhanced tectonic pumping stress (sigma_pump ~ tau_II) +
+#     zero-mean local Reynolds dilatancy for high-strain channel focusing
+#   - Implicit compaction update on Pt & 2nd-order damped-wave elliptic Pf solver
+#   - Local-porosity CFL stepping for rapid viscosity-collapse melt bursts
 #
 # Launch on multi-core Windows CPU:
 #   julia -t auto solver_2d_thmc_mush.jl
@@ -56,13 +59,14 @@ Base.@kwdef struct ModelParams
     g::Float64          = 9.81      # Gravity (m / s^2)
     phi_min::Float64    = 0.015     # Residual locked porosity floor
     phi_max::Float64    = 0.55      # Porosity cap
-    phi_crit::Float64   = 0.45      # Disaggregation limit for Reynolds dilatancy
+    phi_crit::Float64   = 0.45      # Disaggregation limit for granular mush
 
-    # Solid rheology & internal Reynolds dilatancy
+    # Solid rheology, shear tectonic pumping & local Reynolds dilatancy
     eta_s_ref::Float64  = 8.0e18    # Solid shear viscosity at phi_ref (Pa s)
     alpha_phi::Float64  = 23.0      # Porosity-weakening exponent
     tau_yield::Float64  = 35.0e6    # Viscoplastic BDT yield cap (Pa)
-    psi_0::Float64      = 0.15      # Reynolds dilatancy coefficient tan(psi)
+    alpha_pump::Float64 = 1.50      # Shear-to-compaction tectonic pumping coupling (sigma_pump / tau_II)
+    psi_0::Float64      = 0.15      # Local Reynolds dilatancy coefficient tan(psi) for band focusing
     eps_bg::Float64     = 4.5e-13   # Background simple-shear strain rate (s^-1)
     sigma_sq::Float64   = 10.0e6    # Homogeneous squeezing stress for filter pressing (Pa)
 
@@ -82,10 +86,10 @@ Base.@kwdef struct ModelParams
     # Time integration & PT solver controls
     max_t_norm::Float64 = 1.20      # End time in units of tau_cool
     dt_max_frac::Float64 = 0.004    # Max physical step / tau_cool
-    max_steps::Int      = 600       # Max physical time steps
+    max_steps::Int      = 1500      # Max physical time steps (allows fine CFL during melt bursts)
     pt_max_iter::Int    = 10000     # Max PT iterations per physical step
     pt_check_every::Int = 50        # Residual check stride
-    pt_tol::Float64     = 2.0e-4    # Relative PT convergence tolerance
+    pt_tol::Float64     = 3.0e-4    # Relative PT convergence tolerance
     noise_amp::Float64  = 0.020     # Initial smoothed porosity perturbation amplitude
 end
 
@@ -93,7 +97,7 @@ struct CaseConfig
     name::String
     use_shear::Bool            # Switch 1: Simple shear BCs (top/bottom velocity)
     use_squeezing::Bool        # Switch 2: Homogeneous tectonic squeezing (filter pressing)
-    use_dilatancy::Bool        # Switch 3: Internal Reynolds dilatancy (psi_0 > 0)
+    use_dilatancy::Bool        # Switch 3: Shear tectonic pumping + local dilatant channeling
     use_flux_solidus::Bool     # Switch 4a: Thermodynamic flux-depressed solidus (ON for all 4)
     use_visc_feedback::Bool    # Switch 4b: Giordano-Bartels exponential viscosity collapse
 end
@@ -256,11 +260,11 @@ end
     return
 end
 
-# 2.4 Pseudo-Maxwell relaxation of 3D plane-strain normal deviatoric stresses + dilatancy
+# 2.4 Pseudo-Maxwell relaxation of 3D plane-strain normal deviatoric stresses
 @parallel_indices (ix, iz) function update_cell_stresses_pt!(
-    txx, tzz, div_Vs, eII, eta_eff, eps_dil, Res_txx, Res_tzz,
-    Vsx, Vsz, exz, eta_s, phi,
-    dx, dz, use_dil::Int, psi_0, phi_crit, tau_y_nd, theta_m, rel_eta, init_stress::Int, nx, nz
+    txx, tzz, div_Vs, eII, eta_eff, Res_txx, Res_tzz,
+    Vsx, Vsz, exz, eta_s,
+    dx, dz, tau_y_nd, theta_m, rel_eta, init_stress::Int, nx, nz
 )
     if ix <= nx && iz <= nz
         ixp = (ix == nx) ? 1 : ix + 1
@@ -301,15 +305,18 @@ end
             txx[ix, iz]     = (theta_m * txx[ix, iz] + txx_eq) / (theta_m + 1.0)
             tzz[ix, iz]     = (theta_m * tzz[ix, iz] + tzz_eq) / (theta_m + 1.0)
         end
+    end
+    return
+end
 
-        # Internal Reynolds dilatancy with granular disaggregation cutoff (phi -> phi_crit)
-        if use_dil == 1
-            p = phi[ix, iz]
-            disagg = max(0.0, 1.0 - p / phi_crit)^1.5
-            eps_dil[ix, iz] = psi_0 * disagg * e2
-        else
-            eps_dil[ix, iz] = 0.0
+# 2.4b Horizontal mean strain rate per depth (for zero-mean local dilatant channeling)
+@parallel_indices (iz,) function compute_eII_mean_z!(eII_mean_z, eII, nx, nz)
+    if iz <= nz
+        s = 0.0
+        for ix in 1:nx
+            s += eII[ix, iz]
         end
+        eII_mean_z[iz] = s / nx
     end
     return
 end
@@ -345,11 +352,12 @@ end
     return
 end
 
-# 2.6 Pseudo-elastic Pt update (implicit compaction) + damped-wave elliptic Pf update
+# 2.6 Pseudo-elastic Pt update (implicit compaction + shear pumping) & damped-wave Pf update
 @parallel_indices (ix, iz) function update_pressures_pt!(
-    Pt, Pf, dPf, Res_Pt, Res_Pf,
-    div_Vs, qDx, qDz, zeta, eta_eff, eps_dil, mob_x, mob_z,
-    dx, dz, Rc2, r_bulk, theta_m, gamma_f, sigma_sq_nd, nx, nz
+    Pt, Pf, dPf, Res_Pt, Res_Pf, eps_dil,
+    div_Vs, qDx, qDz, zeta, eta_eff, eII, eII_mean_z, phi, mob_x, mob_z,
+    dx, dz, Rc2, r_bulk, theta_m, gamma_f, sigma_sq_nd,
+    use_dil::Int, alpha_pump, psi_0, phi_ref, phi_crit, nx, nz
 )
     if ix <= nx && iz <= nz
         ixp = (ix == nx) ? 1 : ix + 1
@@ -357,8 +365,27 @@ end
         div_qD = (qDx[ixp, iz] - qDx[ix, iz]) / dx +
                  (qDz[ix, iz + 1] - qDz[ix, iz]) / dz
 
-        pc_loc    = Pt[ix, iz] - Pf[ix, iz]
-        comp_term = (pc_loc + sigma_sq_nd) / zeta[ix, iz] - eps_dil[ix, iz]
+        pc_loc = Pt[ix, iz] - Pf[ix, iz]
+
+        if use_dil == 1
+            p      = phi[ix, iz]
+            disagg = max(0.0, 1.0 - p / phi_crit)^1.5
+            tau_II = 2.0 * eta_eff[ix, iz] * eII[ix, iz]
+
+            # 1) Shear-enhanced tectonic compaction pumping (drives net upward export)
+            sig_pump = alpha_pump * disagg * tau_II
+
+            # 2) Zero-mean local Reynolds dilatancy (focuses melt laterally into high-strain bands
+            #    without generating artificial domain-wide vacuum that locks the BDT valve shut)
+            phi_scale   = min(1.0, p / phi_ref)
+            eps_dil_loc = psi_0 * phi_scale * disagg * (eII[ix, iz] - eII_mean_z[iz])
+        else
+            sig_pump    = 0.0
+            eps_dil_loc = 0.0
+        end
+        eps_dil[ix, iz] = eps_dil_loc
+
+        comp_term = (pc_loc + sigma_sq_nd + sig_pump) / zeta[ix, iz] - eps_dil_loc
 
         # Eq 1 (Pt): Pseudo-elastic bulk modulus K_loc = r_bulk * eta_eff / theta_m
         # with implicit treatment of Pt / zeta for unconditional stability
@@ -484,6 +511,35 @@ end
             Fs_z[ix, iz] = (1.0 - p_up) * vs
             Fm_z[ix, iz] = p_up * vs + qDz[ix, iz]
         end
+    end
+    return
+end
+
+# 2.9b Local-porosity CFL advection speed per cell (avoids over-conservative / phi_min scaling)
+@parallel_indices (ix, iz) function compute_local_cfl_speed!(
+    v_cfl, Vsx, Vsz, Fm_x, Fm_z, phi, phi_min, nx, nz
+)
+    if ix <= nx && iz <= nz
+        ixm = (ix == 1) ? nx : ix - 1
+        ixp = (ix == nx) ? 1 : ix + 1
+        pc  = max(phi[ix, iz], phi_min)
+
+        pxL = max(0.5 * (phi[ixm, iz] + phi[ix, iz]), phi_min)
+        pxR = max(0.5 * (phi[ix, iz]  + phi[ixp, iz]), phi_min)
+        pzB = (iz == 1)  ? pc : max(0.5 * (phi[ix, iz - 1] + phi[ix, iz]), phi_min)
+        pzT = (iz == nz) ? pc : max(0.5 * (phi[ix, iz] + phi[ix, iz + 1]), phi_min)
+
+        vm_max = max(
+            abs(Fm_x[ix, iz])     / pxL,
+            abs(Fm_x[ixp, iz])    / pxR,
+            abs(Fm_z[ix, iz])     / pzB,
+            abs(Fm_z[ix, iz + 1]) / pzT
+        )
+        vs_max = max(
+            abs(Vsx[ix, iz]), abs(Vsx[ixp, iz]),
+            abs(Vsz[ix, iz]), abs(Vsz[ix, iz + 1])
+        )
+        v_cfl[ix, iz] = max(vm_max, vs_max)
     end
     return
 end
@@ -758,18 +814,20 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
     Vsx    = Data.Array(Vsx_init)
     Vsz    = @zeros(nx, nz + 1)
 
-    exz     = @zeros(nx, nz + 1)
-    txz     = @zeros(nx, nz + 1)
-    txx     = @zeros(nx, nz)
-    tzz     = @zeros(nx, nz)
-    div_Vs  = @zeros(nx, nz)
-    eII     = @zeros(nx, nz)
-    eps_dil = @zeros(nx, nz)
+    exz        = @zeros(nx, nz + 1)
+    txz        = @zeros(nx, nz + 1)
+    txx        = @zeros(nx, nz)
+    tzz        = @zeros(nx, nz)
+    div_Vs     = @zeros(nx, nz)
+    eII        = @zeros(nx, nz)
+    eII_mean_z = @zeros(nz)
+    eps_dil    = @zeros(nx, nz)
 
-    qDx = @zeros(nx, nz)
-    qDz = @zeros(nx, nz + 1)
-    Fm_x = @zeros(nx, nz); Fs_x = @zeros(nx, nz)
-    Fm_z = @zeros(nx, nz + 1); Fs_z = @zeros(nx, nz + 1)
+    qDx   = @zeros(nx, nz)
+    qDz   = @zeros(nx, nz + 1)
+    Fm_x  = @zeros(nx, nz); Fs_x = @zeros(nx, nz)
+    Fm_z  = @zeros(nx, nz + 1); Fs_z = @zeros(nx, nz + 1)
+    v_cfl = @zeros(nx, nz)
 
     Res_vx  = @zeros(nx, nz)
     Res_vz  = @zeros(nx, nz + 1)
@@ -830,9 +888,8 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
                 dx, dz, U_bot, U_top, use_shear_i, tau_y_nd, theta_m, 1.0, 1, nx, nz
             )
             @parallel (1:nx, 1:nz) update_cell_stresses_pt!(
-                txx, tzz, div_Vs, eII, eta_eff, eps_dil, Res_txx, Res_tzz,
-                Vsx, Vsz, exz, eta_s, phi, dx, dz, use_dil_i, p.psi_0, p.phi_crit,
-                tau_y_nd, theta_m, 1.0, 1, nx, nz
+                txx, tzz, div_Vs, eII, eta_eff, Res_txx, Res_tzz,
+                Vsx, Vsz, exz, eta_s, dx, dz, tau_y_nd, theta_m, 1.0, 1, nx, nz
             )
         end
 
@@ -842,25 +899,28 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
         pt_iters = 0
 
         for iter in 1:p.pt_max_iter
-            # Step 2a: Relax deviatoric stresses & compute fresh div_Vs, eII, dilatancy from Vs
+            # Step 2a: Relax deviatoric stresses & compute fresh div_Vs, eII from Vs
             @parallel (1:nx, 1:nz+1) update_vertex_shear_pt!(
                 exz, txz, eta_sv_eff, Res_txz, Vsx, Vsz, eta_sv,
                 dx, dz, U_bot, U_top, use_shear_i, tau_y_nd, theta_m, rel_eta, 0, nx, nz
             )
             @parallel (1:nx, 1:nz) update_cell_stresses_pt!(
-                txx, tzz, div_Vs, eII, eta_eff, eps_dil, Res_txx, Res_tzz,
-                Vsx, Vsz, exz, eta_s, phi, dx, dz, use_dil_i, p.psi_0, p.phi_crit,
-                tau_y_nd, theta_m, rel_eta, 0, nx, nz
+                txx, tzz, div_Vs, eII, eta_eff, Res_txx, Res_tzz,
+                Vsx, Vsz, exz, eta_s, dx, dz, tau_y_nd, theta_m, rel_eta, 0, nx, nz
             )
+            if use_dil_i == 1
+                @parallel (1:nz,) compute_eII_mean_z!(eII_mean_z, eII, nx, nz)
+            end
 
-            # Step 2b: Update Darcy fluxes & pressures (Pt, Pf) using fresh div_Vs
+            # Step 2b: Update Darcy fluxes & pressures (Pt, Pf) using fresh div_Vs & eII
             @parallel (1:nx, 1:nz+1) update_darcy_flux!(
                 qDx, qDz, Pf, mob_x, mob_z, phi, dx, dz, Rc2, nx, nz
             )
             @parallel (1:nx, 1:nz) update_pressures_pt!(
-                Pt, Pf, dPf, Res_Pt, Res_Pf,
-                div_Vs, qDx, qDz, zeta, eta_eff, eps_dil, mob_x, mob_z,
-                dx, dz, Rc2, r_bulk, theta_m, gamma_f, sigma_sq_nd, nx, nz
+                Pt, Pf, dPf, Res_Pt, Res_Pf, eps_dil,
+                div_Vs, qDx, qDz, zeta, eta_eff, eII, eII_mean_z, phi, mob_x, mob_z,
+                dx, dz, Rc2, r_bulk, theta_m, gamma_f, sigma_sq_nd,
+                use_dil_i, p.alpha_pump, p.psi_0, phi_ref, p.phi_crit, nx, nz
             )
 
             # Step 2c: Symplectic velocity update using fresh (txx, tzz, txz, Pt)
@@ -905,18 +965,15 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
             error("PT failed to converge in case $(cfg.name) at step $(step) after $(pt_iters) iters (pt_err=$(pt_err)).")
         end
 
-        # 3) Conservative phase fluxes & adaptive CFL time step
+        # 3) Conservative phase fluxes & local-porosity adaptive CFL time step
         @parallel (1:nx, 1:nz+1) compute_phase_fluxes!(
             Fm_x, Fs_x, Fm_z, Fs_z, Vsx, Vsz, qDx, qDz, phi, nx, nz
         )
-
-        vmax_nd = max(
-            maximum(abs, Vsx),
-            maximum(abs, Vsz),
-            maximum(abs, Fm_x) / p.phi_min,
-            maximum(abs, Fm_z) / p.phi_min,
-            1.0e-12
+        @parallel (1:nx, 1:nz) compute_local_cfl_speed!(
+            v_cfl, Vsx, Vsz, Fm_x, Fm_z, phi, p.phi_min, nx, nz
         )
+
+        vmax_nd = max(maximum(v_cfl), 1.0e-12)
         if !isfinite(vmax_nd)
             error("Non-finite velocity in case $(cfg.name) at step $(step).")
         end
@@ -993,9 +1050,10 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
         push!(hist_min_eta, min_eta_val)
         push!(hist_bdt_vol, trap_melt_vol)
 
-        if verbose && (step == 1 || step % 40 == 0 || t_s >= t_end_s)
-            @printf("    step=%4d | t/tc=%5.3f | PT=%4d (err=%.1e) | Export=%6.2f m | TrapLi=%7.1f ppm | minEta=%.2e\n",
-                    step, t_s / tau_cool_s, pt_iters, pt_err, trap_melt_vol, trap_li, min_eta_val)
+        if verbose && (step == 1 || step % 40 == 0 || t_s >= t_end_s || step == p.max_steps)
+            pf_top_MPa = maximum(@view Pf[:, nz]) * (sigma0 / 1.0e6)
+            @printf("    step=%4d | t/tc=%5.3f | PT=%4d (err=%.1e) | Pf_top=%+5.2f MPa | Export=%6.2f m | TrapLi=%7.1f ppm | minEta=%.2e\n",
+                    step, t_s / tau_cool_s, pt_iters, pt_err, pf_top_MPa, trap_melt_vol, trap_li, min_eta_val)
         end
     end
 
@@ -1101,7 +1159,7 @@ function run_phase_diagram_sweep(base_p::ModelParams; outdir::String = "output_2
             nx = 64, nz = 64,
             eps_bg = eps_grid[i],
             eta_m0 = eta_grid[j],
-            max_steps = 350,
+            max_steps = 900,
             pt_max_iter = 6000
         )
         res = run_2d_case(cfg_coupled, p_ij; verbose = false)
