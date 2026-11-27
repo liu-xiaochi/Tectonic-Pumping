@@ -4,18 +4,21 @@
 # Uses the Pseudo-Maxwell Viscoelastic Symplectic PT Stokes-Darcy formulation
 # (Räss et al. 2022, GMD) with:
 #   - 3D plane-strain deviatoric stresses + log-space viscoplastic relaxation
-#   - Shear-enhanced tectonic pumping stress (sigma_pump ~ tau_II) +
-#     zero-mean local Reynolds dilatancy for high-strain channel focusing
-#   - Implicit compaction update on Pt & 2nd-order damped-wave elliptic Pf solver
-#   - Local-porosity CFL stepping for rapid viscosity-collapse melt bursts
+#   - Smoothly tapered shear tectonic pumping (sigma_pump -> 0 as phi -> phi_min)
+#     + zero-mean local Reynolds dilatancy for high-strain channel focusing
+#   - Smooth quadratic top Palaeo-BDT valve with weak pressure anchor (no PT shock)
+#   - Balanced PT parameters stable across >10^3 vertical viscosity contrasts
+#   - Local-porosity CFL stepping + active (t/tc=0.25) & peak-export snapshots
 #
 # Launch on multi-core Windows CPU:
 #   julia -t auto solver_2d_thmc_mush.jl
 #
 # Outputs (saved in ./output_2d/, directly compatible with Fig. 3 Python script):
-#   - snapshots_{static,filter,shear_const,coupled}.npz  (shape: nz x nx)
-#   - time_series.npz                                    (4-case temporal curves)
-#   - phase_diagram_grid.npz                             (optional sweep mode)
+#   - snapshots_{static,filter,shear_const,coupled}.npz         (final state)
+#   - snapshots_active_{static,filter,shear_const,coupled}.npz  (sync t/tc ~ 0.25)
+#   - snapshots_peak_{static,filter,shear_const,coupled}.npz    (peak export flux)
+#   - time_series.npz                                           (4-case curves)
+#   - phase_diagram_grid.npz                                    (optional sweep)
 # ==============================================================================
 
 using ParallelStencil
@@ -84,13 +87,14 @@ Base.@kwdef struct ModelParams
     V_peg_crit::Float64 = 12.0      # Critical exported melt batch thickness (m)
 
     # Time integration & PT solver controls
-    max_t_norm::Float64 = 1.20      # End time in units of tau_cool
-    dt_max_frac::Float64 = 0.004    # Max physical step / tau_cool
-    max_steps::Int      = 1500      # Max physical time steps (allows fine CFL during melt bursts)
-    pt_max_iter::Int    = 10000     # Max PT iterations per physical step
-    pt_check_every::Int = 50        # Residual check stride
-    pt_tol::Float64     = 3.0e-4    # Relative PT convergence tolerance
-    noise_amp::Float64  = 0.020     # Initial smoothed porosity perturbation amplitude
+    max_t_norm::Float64    = 1.20   # End time in units of tau_cool
+    dt_max_frac::Float64   = 0.004  # Max physical step / tau_cool
+    max_steps::Int         = 1500   # Max physical time steps (allows fine CFL during melt bursts)
+    pt_max_iter::Int       = 12000  # Max PT iterations per physical step
+    pt_check_every::Int    = 50     # Residual check stride
+    pt_tol::Float64        = 3.0e-4 # Relative PT convergence tolerance
+    noise_amp::Float64     = 0.020  # Initial smoothed porosity perturbation amplitude
+    t_active_snap::Float64 = 0.25   # Synchronous dimensionless time for active-mush snapshot
 end
 
 struct CaseConfig
@@ -139,10 +143,10 @@ end
     return
 end
 
-# 2.2 Compute harmonic face mobilities & vertex viscosities
+# 2.2 Compute harmonic face mobilities (with smooth top BDT valve taper) & vertex viscosities
 @parallel_indices (ix, iz) function update_face_and_vertex_props!(
     mob_x, mob_z, eta_sv,
-    mob_c, eta_s, nx, nz
+    mob_c, eta_s, phi, phi_min, nx, nz
 )
     ixm = (ix == 1) ? nx : ix - 1
 
@@ -160,7 +164,10 @@ end
             e1 = eta_s[ixm, 1]; e2 = eta_s[ix, 1]
             eta_sv[ix, 1] = 2.0 * e1 * e2 / (e1 + e2 + 1.0e-30)
         elseif iz == nz + 1
-            mob_z[ix, nz + 1] = mob_c[ix, nz]  # Open Palaeo-BDT valve mobility
+            # Smooth quadratic Palaeo-BDT valve sealing toward percolation floor phi_min
+            # (keeps a weak 1e-5 Dirichlet anchor to avoid elliptic pressure shock)
+            valve_fac         = clamp((phi[ix, nz] - phi_min) / 0.025, 0.0, 1.0)^2
+            mob_z[ix, nz + 1] = mob_c[ix, nz] * max(valve_fac, 1.0e-5)
             e1 = eta_s[ixm, nz]; e2 = eta_s[ix, nz]
             eta_sv[ix, nz + 1] = 2.0 * e1 * e2 / (e1 + e2 + 1.0e-30)
         else
@@ -324,7 +331,7 @@ end
 # 2.5 Update Darcy fluxes qDx, qDz from excess melt pressure Pf (qD = -Rc2 * M * grad(Pf))
 @parallel_indices (ix, iz) function update_darcy_flux!(
     qDx, qDz,
-    Pf, mob_x, mob_z, phi,
+    Pf, mob_x, mob_z,
     dx, dz, Rc2, nx, nz
 )
     ixm = (ix == 1) ? nx : ix - 1
@@ -339,8 +346,8 @@ end
         if iz == 1
             qDz[ix, 1] = 0.0  # Impermeable base
         elseif iz == nz + 1
-            # Top Palaeo-BDT one-way valve: escapes when excess melt pressure Pf > 0
-            if Pf[ix, nz] > 0.0 && phi[ix, nz] > 0.025
+            # Smoothly tapered top Palaeo-BDT one-way valve (no hard phi step cutoff)
+            if Pf[ix, nz] > 0.0
                 qDz[ix, nz + 1] = Rc2 * mob_z[ix, nz + 1] * (Pf[ix, nz] / (0.5 * dz))
             else
                 qDz[ix, nz + 1] = 0.0
@@ -352,12 +359,12 @@ end
     return
 end
 
-# 2.6 Pseudo-elastic Pt update (implicit compaction + shear pumping) & damped-wave Pf update
+# 2.6 Pseudo-elastic Pt update (implicit compaction + tapered shear pumping) & damped-wave Pf
 @parallel_indices (ix, iz) function update_pressures_pt!(
     Pt, Pf, dPf, Res_Pt, Res_Pf, eps_dil,
     div_Vs, qDx, qDz, zeta, eta_eff, eII, eII_mean_z, phi, mob_x, mob_z,
     dx, dz, Rc2, r_bulk, theta_m, gamma_f, sigma_sq_nd,
-    use_dil::Int, alpha_pump, psi_0, phi_ref, phi_crit, nx, nz
+    use_dil::Int, alpha_pump, psi_0, phi_ref, phi_min, phi_crit, nx, nz
 )
     if ix <= nx && iz <= nz
         ixp = (ix == nx) ? 1 : ix + 1
@@ -368,17 +375,18 @@ end
         pc_loc = Pt[ix, iz] - Pf[ix, iz]
 
         if use_dil == 1
-            p      = phi[ix, iz]
-            disagg = max(0.0, 1.0 - p / phi_crit)^1.5
-            tau_II = 2.0 * eta_eff[ix, iz] * eII[ix, iz]
+            p          = phi[ix, iz]
+            disagg     = max(0.0, 1.0 - p / phi_crit)^1.5
+            # Smooth solidification cutoff: locked sub-percolation rock generates no fluid overpressure
+            lock_taper = clamp((p - phi_min) / 0.03, 0.0, 1.0)
+            tau_II     = 2.0 * eta_eff[ix, iz] * eII[ix, iz]
 
             # 1) Shear-enhanced tectonic compaction pumping (drives net upward export)
-            sig_pump = alpha_pump * disagg * tau_II
+            sig_pump = alpha_pump * lock_taper * disagg * tau_II
 
-            # 2) Zero-mean local Reynolds dilatancy (focuses melt laterally into high-strain bands
-            #    without generating artificial domain-wide vacuum that locks the BDT valve shut)
+            # 2) Zero-mean local Reynolds dilatancy (focuses melt laterally into high-strain bands)
             phi_scale   = min(1.0, p / phi_ref)
-            eps_dil_loc = psi_0 * phi_scale * disagg * (eII[ix, iz] - eII_mean_z[iz])
+            eps_dil_loc = psi_0 * lock_taper * phi_scale * disagg * (eII[ix, iz] - eII_mean_z[iz])
         else
             sig_pump    = 0.0
             eps_dil_loc = 0.0
@@ -692,7 +700,7 @@ end
 end
 
 # ==============================================================================
-# 3. HELPER: SMOOTHED 2D INITIAL POROSITY PERTURBATION (MESH-INDEPENDENT)
+# 3. HELPERS: INITIAL PERTURBATION & SNAPSHOT PACKER
 # ==============================================================================
 function make_smooth_noise(nx::Int, nz::Int, amp::Float64; seed::Int = 42, passes::Int = 4)
     rng = MersenneTwister(seed)
@@ -714,10 +722,42 @@ function make_smooth_noise(nx::Int, nz::Int, amp::Float64; seed::Int = 42, passe
     return (maxabs > 0.0) ? (amp .* field ./ maxabs) : zeros(nx, nz)
 end
 
+function pack_snapshot(
+    x_phys, z_phys, phi, C_Li, Cf, eta_m_phys, T, Pt, Pf, eII,
+    qDx, qDz, Vsx, Vsz, sigma0, v0, t0, nz, t_norm_val, export_val, trap_li_val
+)
+    qDx_c  = 0.5 .* (Array(qDx) .+ circshift(Array(qDx), (-1, 0))) .* v0
+    qDz_c  = 0.5 .* (Array(qDz)[:, 1:nz] .+ Array(qDz)[:, 2:nz+1]) .* v0
+    Vsx_c  = 0.5 .* (Array(Vsx) .+ circshift(Array(Vsx), (-1, 0))) .* v0
+    Vsz_c  = 0.5 .* (Array(Vsz)[:, 1:nz] .+ Array(Vsz)[:, 2:nz+1]) .* v0
+    Pc_MPa = (Array(Pt) .- Array(Pf)) .* (sigma0 / 1.0e6)
+    Pf_MPa = Array(Pf) .* (sigma0 / 1.0e6)
+
+    return Dict{String, Any}(
+        "x"        => x_phys,
+        "z"        => z_phys,
+        "t_norm"   => Float64[t_norm_val],
+        "export_m" => Float64[export_val],
+        "trap_li"  => Float64[trap_li_val],
+        "phi"      => permutedims(Array(phi)),
+        "C_Li"     => permutedims(Array(C_Li)),
+        "Cf"       => permutedims(Array(Cf)),
+        "eta_m"    => permutedims(Array(eta_m_phys)),
+        "T"        => permutedims(Array(T)),
+        "Pc_MPa"   => permutedims(Pc_MPa),
+        "Pf_MPa"   => permutedims(Pf_MPa),
+        "eII_s"    => permutedims(Array(eII) ./ t0),
+        "qDx"      => permutedims(qDx_c),
+        "qDz"      => permutedims(qDz_c),
+        "Vsx"      => permutedims(Vsx_c),
+        "Vsz"      => permutedims(Vsz_c),
+    )
+end
+
 # ==============================================================================
 # 4. MAIN 2D SIMULATION DRIVER FOR ONE CASE
 # ==============================================================================
-function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
+function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true, save_snapshots::Bool = true)
     t_wall0 = time()
     nx, nz = p.nx, p.nz
     dx_phys, dz_phys = p.Lx / nx, p.Lz / nz
@@ -837,20 +877,25 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
     Res_tzz = @zeros(nx, nz)
     Res_txz = @zeros(nx, nz + 1)
 
-    # Optimal Pseudo-Maxwell PT parameters (O(N) damping across all modes & viscosity contrasts)
+    # Balanced Pseudo-Maxwell PT parameters (stable across >10^3 vertical viscosity jumps)
     nmax    = max(nx, nz)
-    cfl_v   = 0.55              # 2D staggered-grid leapfrog CFL (limit = 1/sqrt(2) ~ 0.707)
-    r_bulk  = 0.50              # Pseudo bulk-to-shear modulus ratio K/G
-    theta_m = 2.5 * nmax        # Uniform Maxwell relaxation time (in PT iterations)
+    cfl_v   = 0.58              # 2D staggered-grid leapfrog CFL (8*cfl^2 = 2.69 < 4.0)
+    r_bulk  = 0.50              # Keeps high deviatoric damping fraction for stiff-lid modes
+    theta_m = 2.3 * nmax        # Preserves low-frequency vertical-contrast damping
     gamma_f = 6.0 / nmax        # Optimal 2nd-order damping for elliptic Pf solver
     rel_eta = 0.20              # Log-space viscoplastic viscosity under-relaxation
 
-    # Diagnostic history
+    # Diagnostic history & active/peak snapshot holders
     hist_t_norm  = Float64[]
     hist_trap_li = Float64[]
     hist_peak_li = Float64[]
     hist_min_eta = Float64[]
     hist_bdt_vol = Float64[]
+
+    snap_active::Union{Nothing, Dict{String, Any}} = nothing
+    snap_peak::Union{Nothing, Dict{String, Any}}   = nothing
+    best_q_out   = 0.0
+    peak_t_norm  = 0.0
 
     trap_melt_vol = 0.0   # Horizontally averaged cumulative BDT export thickness (m)
     trap_li_mass  = 0.0   # Horizontally averaged cumulative BDT Li mass (ppm * m)
@@ -876,7 +921,7 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
             M0, use_vfb_i, nx, nz
         )
         @parallel (1:nx, 1:nz+1) update_face_and_vertex_props!(
-            mob_x, mob_z, eta_sv, mob_c, eta_s, nx, nz
+            mob_x, mob_z, eta_sv, mob_c, eta_s, phi, p.phi_min, nx, nz
         )
 
         # Initialize effective viscosities & equilibrium stresses at step 0; warm-start for step >= 1
@@ -895,8 +940,12 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
 
         # 2) Pseudo-Maxwell Symplectic PT Stokes-Darcy solve in (tau, Pt, Pf, Vs)
         dPf .= 0.0
-        pt_err   = 1.0
-        pt_iters = 0
+        pt_err      = 1.0
+        pt_iters    = 0
+        err_v_rel   = 1.0
+        err_pt_rel  = 1.0
+        err_pf_rel  = 1.0
+        err_tau_rel = 1.0
 
         for iter in 1:p.pt_max_iter
             # Step 2a: Relax deviatoric stresses & compute fresh div_Vs, eII from Vs
@@ -914,13 +963,13 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
 
             # Step 2b: Update Darcy fluxes & pressures (Pt, Pf) using fresh div_Vs & eII
             @parallel (1:nx, 1:nz+1) update_darcy_flux!(
-                qDx, qDz, Pf, mob_x, mob_z, phi, dx, dz, Rc2, nx, nz
+                qDx, qDz, Pf, mob_x, mob_z, dx, dz, Rc2, nx, nz
             )
             @parallel (1:nx, 1:nz) update_pressures_pt!(
                 Pt, Pf, dPf, Res_Pt, Res_Pf, eps_dil,
                 div_Vs, qDx, qDz, zeta, eta_eff, eII, eII_mean_z, phi, mob_x, mob_z,
                 dx, dz, Rc2, r_bulk, theta_m, gamma_f, sigma_sq_nd,
-                use_dil_i, p.alpha_pump, p.psi_0, phi_ref, p.phi_crit, nx, nz
+                use_dil_i, p.alpha_pump, p.psi_0, phi_ref, p.phi_min, p.phi_crit, nx, nz
             )
 
             # Step 2c: Symplectic velocity update using fresh (txx, tzz, txz, Pt)
@@ -946,11 +995,15 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
                                 abs(sigma_sq_nd) / minimum(zeta))
                 scale_tau = max(1.0, maximum(abs, txx), maximum(abs, tzz), maximum(abs, txz))
 
-                pt_err = max(err_v / scale_v, err_pt / scale_p, err_pf / scale_p, err_tau / scale_tau)
+                err_v_rel   = err_v / scale_v
+                err_pt_rel  = err_pt / scale_p
+                err_pf_rel  = err_pf / scale_p
+                err_tau_rel = err_tau / scale_tau
+                pt_err      = max(err_v_rel, err_pt_rel, err_pf_rel, err_tau_rel)
 
                 if verbose && step == 0 && iter % 500 == 0
                     @printf("      [step 0 PT iter %4d] err_v=%.2e | err_pt=%.2e | err_pf=%.2e | err_tau=%.2e | pt_err=%.2e\n",
-                            iter, err_v / scale_v, err_pt / scale_p, err_pf / scale_p, err_tau / scale_tau, pt_err)
+                            iter, err_v_rel, err_pt_rel, err_pf_rel, err_tau_rel, pt_err)
                 end
                 if !isfinite(pt_err)
                     error("PT diverged at step $(step), iter $(iter) (err_v=$(err_v), err_pt=$(err_pt), err_pf=$(err_pf)).")
@@ -962,7 +1015,8 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
         end
 
         if pt_err > 1.0e-2
-            error("PT failed to converge in case $(cfg.name) at step $(step) after $(pt_iters) iters (pt_err=$(pt_err)).")
+            error(@sprintf("PT failed to converge in case %s at step %d after %d iters (err_v=%.2e, err_pt=%.2e, err_pf=%.2e, err_tau=%.2e).",
+                           cfg.name, step, pt_iters, err_v_rel, err_pt_rel, err_pf_rel, err_tau_rel))
         end
 
         # 3) Conservative phase fluxes & local-porosity adaptive CFL time step
@@ -1024,8 +1078,9 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
 
         t_s  += dt_s
         step += 1
+        t_norm_now = t_s / tau_cool_s
 
-        # 7) Diagnostics: shallow BDT trap Li & active mush metrics
+        # 7) Diagnostics: shallow BDT trap Li, active mush metrics & snapshots
         if trap_melt_vol > 1.0e-4
             V   = trap_melt_vol
             Vc  = p.V_peg_crit
@@ -1044,54 +1099,71 @@ function run_2d_case(cfg::CaseConfig, p::ModelParams; verbose::Bool = true)
         peak_mush_li = any(mob_mask) ? maximum(li_arr[mob_mask]) : p.Li_0
         min_eta_val  = minimum(eta_arr)
 
-        push!(hist_t_norm,  t_s / tau_cool_s)
+        push!(hist_t_norm,  t_norm_now)
         push!(hist_trap_li, trap_li)
         push!(hist_peak_li, max(peak_mush_li, trap_li))
         push!(hist_min_eta, min_eta_val)
         push!(hist_bdt_vol, trap_melt_vol)
 
+        # Capture synchronous active-mush snapshot (t/tc ~ 0.25) and peak-export snapshot
+        if save_snapshots
+            if snap_active === nothing && t_norm_now >= p.t_active_snap
+                snap_active = pack_snapshot(
+                    x_phys, z_phys, phi, C_Li, Cf, eta_m_phys, T, Pt, Pf, eII,
+                    qDx, qDz, Vsx, Vsz, sigma0, v0, t0, nz,
+                    t_norm_now, trap_melt_vol, trap_li
+                )
+            end
+            if t_norm_now >= 0.08 && q_out_mean > best_q_out
+                best_q_out  = q_out_mean
+                peak_t_norm = t_norm_now
+                snap_peak   = pack_snapshot(
+                    x_phys, z_phys, phi, C_Li, Cf, eta_m_phys, T, Pt, Pf, eII,
+                    qDx, qDz, Vsx, Vsz, sigma0, v0, t0, nz,
+                    t_norm_now, trap_melt_vol, trap_li
+                )
+            end
+        end
+
         if verbose && (step == 1 || step % 40 == 0 || t_s >= t_end_s || step == p.max_steps)
             pf_top_MPa = maximum(@view Pf[:, nz]) * (sigma0 / 1.0e6)
             @printf("    step=%4d | t/tc=%5.3f | PT=%4d (err=%.1e) | Pf_top=%+5.2f MPa | Export=%6.2f m | TrapLi=%7.1f ppm | minEta=%.2e\n",
-                    step, t_s / tau_cool_s, pt_iters, pt_err, pf_top_MPa, trap_melt_vol, trap_li, min_eta_val)
+                    step, t_norm_now, pt_iters, pt_err, pf_top_MPa, trap_melt_vol, trap_li, min_eta_val)
         end
     end
 
-    # Cell-centered velocities, Darcy fluxes & compaction pressure Pc = Pt - Pf
-    qDx_c   = 0.5 .* (Array(qDx) .+ circshift(Array(qDx), (-1, 0))) .* v0
-    qDz_c   = 0.5 .* (Array(qDz)[:, 1:nz] .+ Array(qDz)[:, 2:nz+1]) .* v0
-    Vsx_c   = 0.5 .* (Array(Vsx) .+ circshift(Array(Vsx), (-1, 0))) .* v0
-    Vsz_c   = 0.5 .* (Array(Vsz)[:, 1:nz] .+ Array(Vsz)[:, 2:nz+1]) .* v0
-    Pc_MPa  = (Array(Pt) .- Array(Pf)) .* (sigma0 / 1.0e6)
-    Pf_MPa  = Array(Pf) .* (sigma0 / 1.0e6)
+    snap_final = save_snapshots ? pack_snapshot(
+        x_phys, z_phys, phi, C_Li, Cf, eta_m_phys, T, Pt, Pf, eII,
+        qDx, qDz, Vsx, Vsz, sigma0, v0, t0, nz,
+        hist_t_norm[end], trap_melt_vol, hist_trap_li[end]
+    ) : nothing
+
+    if save_snapshots
+        if snap_active === nothing
+            snap_active = snap_final
+        end
+        if snap_peak === nothing
+            snap_peak   = snap_active
+            peak_t_norm = snap_peak["t_norm"][1]
+        end
+    end
 
     elapsed = time() - t_wall0
     if verbose
-        @printf(">>> Finished %-12s in %.1f s | Final Export = %.2f m | BDT Trap Li = %.1f ppm | Min eta_m = %.2e Pa s\n",
-                cfg.name, elapsed, trap_melt_vol, hist_trap_li[end], minimum(hist_min_eta))
+        @printf(">>> Finished %-12s in %.1f s | PeakFlux @ t/tc=%.3f | Final Export = %.2f m | BDT Trap Li = %.1f ppm | Min eta_m = %.2e Pa s\n",
+                cfg.name, elapsed, peak_t_norm, trap_melt_vol, hist_trap_li[end], minimum(hist_min_eta))
     end
 
     return Dict{String, Any}(
-        "case"      => cfg.name,
-        "x"         => x_phys,
-        "z"         => z_phys,
-        "phi"       => permutedims(Array(phi)),
-        "C_Li"      => permutedims(Array(C_Li)),
-        "Cf"        => permutedims(Array(Cf)),
-        "eta_m"     => permutedims(Array(eta_m_phys)),
-        "T"         => permutedims(Array(T)),
-        "Pc_MPa"    => permutedims(Pc_MPa),
-        "Pf_MPa"    => permutedims(Pf_MPa),
-        "eII_s"     => permutedims(Array(eII) ./ t0),
-        "qDx"       => permutedims(qDx_c),
-        "qDz"       => permutedims(qDz_c),
-        "Vsx"       => permutedims(Vsx_c),
-        "Vsz"       => permutedims(Vsz_c),
-        "t_norm"    => hist_t_norm,
-        "trap_li"   => hist_trap_li,
-        "peak_li"   => hist_peak_li,
-        "min_eta"   => hist_min_eta,
-        "bdt_vol"   => hist_bdt_vol,
+        "case"        => cfg.name,
+        "snap_final"  => snap_final,
+        "snap_active" => snap_active,
+        "snap_peak"   => snap_peak,
+        "t_norm"      => hist_t_norm,
+        "trap_li"     => hist_trap_li,
+        "peak_li"     => hist_peak_li,
+        "min_eta"     => hist_min_eta,
+        "bdt_vol"     => hist_bdt_vol,
     )
 end
 
@@ -1112,25 +1184,11 @@ function run_four_ablation_cases(p::ModelParams; outdir::String = "output_2d")
     ts_dict = Dict{String, Any}()
 
     for cfg in cases
-        res = run_2d_case(cfg, p; verbose = true)
+        res = run_2d_case(cfg, p; verbose = true, save_snapshots = true)
 
-        snap_path = joinpath(outdir, "snapshots_$(cfg.name).npz")
-        npzwrite(snap_path, Dict{String, Any}(
-            "x"      => res["x"],
-            "z"      => res["z"],
-            "phi"    => res["phi"],
-            "C_Li"   => res["C_Li"],
-            "Cf"     => res["Cf"],
-            "eta_m"  => res["eta_m"],
-            "T"      => res["T"],
-            "Pc_MPa" => res["Pc_MPa"],
-            "Pf_MPa" => res["Pf_MPa"],
-            "eII_s"  => res["eII_s"],
-            "qDx"    => res["qDx"],
-            "qDz"    => res["qDz"],
-            "Vsx"    => res["Vsx"],
-            "Vsz"    => res["Vsz"],
-        ))
+        npzwrite(joinpath(outdir, "snapshots_$(cfg.name).npz"),        res["snap_final"])
+        npzwrite(joinpath(outdir, "snapshots_active_$(cfg.name).npz"), res["snap_active"])
+        npzwrite(joinpath(outdir, "snapshots_peak_$(cfg.name).npz"),   res["snap_peak"])
 
         ts_dict["t_norm_$(cfg.name)"]  = res["t_norm"]
         ts_dict["trap_li_$(cfg.name)"] = res["trap_li"]
@@ -1140,7 +1198,7 @@ function run_four_ablation_cases(p::ModelParams; outdir::String = "output_2d")
     end
 
     npzwrite(joinpath(outdir, "time_series.npz"), ts_dict)
-    @printf("\n[DONE] Saved all 4 2D snapshots and time_series.npz into ./%s/\n", outdir)
+    @printf("\n[DONE] Saved final/active/peak 2D snapshots and time_series.npz into ./%s/\n", outdir)
 end
 
 function run_phase_diagram_sweep(base_p::ModelParams; outdir::String = "output_2d")
@@ -1160,9 +1218,9 @@ function run_phase_diagram_sweep(base_p::ModelParams; outdir::String = "output_2
             eps_bg = eps_grid[i],
             eta_m0 = eta_grid[j],
             max_steps = 900,
-            pt_max_iter = 6000
+            pt_max_iter = 8000
         )
-        res = run_2d_case(cfg_coupled, p_ij; verbose = false)
+        res = run_2d_case(cfg_coupled, p_ij; verbose = false, save_snapshots = false)
         peak_li_grid[j, i] = maximum(res["trap_li"])
         export_grid[j, i]  = res["bdt_vol"][end]
         @printf("  (%2d/%2d, %2d/%2d) eps=%.1e, eta_m0=%.1e -> TrapLi=%7.1f ppm, Export=%5.2f m\n",
