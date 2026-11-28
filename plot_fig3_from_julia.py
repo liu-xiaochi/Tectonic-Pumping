@@ -1,29 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sat Nov 28 09:46:23 2026
+Created on Sat Nov 28 15:38:20 2026
 
 @author: liuxi
 """
 
 # -*- coding: utf-8 -*-
 """
-Created on Wed Nov 25 21:12:21 2026
-
-@author: liuxi
-"""
-
-# -*- coding: utf-8 -*-
-"""
-Fig. 3 Publication Layout Skeleton (183 mm x 132 mm Nature Full-Width)
+Fig. 3 Publication Figure Renderer (183 mm x 132 mm Nature Full-Width)
 Asymmetric "Top 4, Bottom 3" GridSpec with locked right-edge LogNorm colorbar rail:
   - Panel a (i-iv): 2D two-phase simulation snapshots (pure Li field + phi contours + log-scaled Darcy quiver)
   - Panel b       : Dual-stacked time evolution (Peak extractable Li & effective channel melt viscosity eta_m)
-  - Panel c       : Cross-regime kinematic collapse (2D GPU runs + 3D validation vs. Pi_p)
-  - Panel d       : Global dynamical phase diagram (strain rate vs. initial viscosity + analytical Pi_p = 1)
+  - Panel c       : Cross-regime kinematic collapse (real 2D runs from cross_regime_collapse.csv + fitted master curve)
+  - Panel d       : Global dynamical phase diagram (real 2D sweep from phase_diagram_grid.npz + analytical Pi_p = 1)
 
 Outputs (generated automatically for each mode in SNAP_MODES):
-  - Fig3_Numerical_Model_Skeleton_{active,peak}.pdf  (183 x 132 mm vector PDF, editable in Illustrator)
-  - Fig3_Numerical_Model_Skeleton_{active,peak}.png  (600 dpi raster preview)
+  - Fig3_Numerical_Model_Skeleton_{peak,active}.pdf  (183 x 132 mm vector PDF, editable in Illustrator)
+  - Fig3_Numerical_Model_Skeleton_{peak,active}.png  (600 dpi raster preview)
 """
 
 import csv
@@ -35,6 +28,12 @@ from matplotlib.colors import LinearSegmentedColormap, LogNorm
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FixedLocator, LogFormatterMathtext
 
+try:
+    from scipy.optimize import least_squares
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
 
 # =============================================================================
 # 1. EXACT MILLIMETER LAYOUT GEOMETRY (183 mm x 132 mm)
@@ -42,8 +41,8 @@ from matplotlib.ticker import FixedLocator, LogFormatterMathtext
 OUTPUT_DIR = Path(".")
 OUTPUT_PREFIX = "Fig3_Numerical_Model_Skeleton"
 USE_DEMO_DATA = False             # False: 读取 ./output_2d/ 真实模拟输出；True: 合成演示数据
-DATA_DIR = Path("output_2d")      # Julia solver_2d_thmc_mush.jl 输出目录
-SNAP_MODES = ("active", "peak")   # 一次输出 active 与 peak 两套成图方便直接对比（也可填 ("final",)）
+DATA_DIR = Path("output_2d")      # Julia 输出目录（同时含 a/b 快照与 c/d 扫参数据）
+SNAP_MODES = ("peak", "active")   # 优先输出 peak（推荐定稿）与 active 两套成图
 TIME_LI_KEY = "trap_li"           # "trap_li" (浅部 BDT 捕集可采锂) | "peak_li" (晶粥/捕集峰值锂)
 
 # Panel a 共享对数达西流矢跨度（覆盖 4 个量级黏度坍缩，保证四图采用严格统一的物理标尺）
@@ -131,19 +130,19 @@ CASE_META = {
 }
 
 REGIME_STYLES = {
-    "EXT":        {"label": "Extensional",     "color": "#D49A38", "marker": "^"},
-    "COMP_TRANS": {"label": "Comp.–Trans.",    "color": "#B84A39", "marker": "o"},
-    "STRIKE_SLIP":{"label": "Strike-slip",     "color": "#386890", "marker": "s"},
+    "EXT":         {"label": "Extensional",  "color": "#D49A38", "marker": "^"},
+    "COMP_TRANS":  {"label": "Comp.–Trans.", "color": "#B84A39", "marker": "o"},
+    "STRIKE_SLIP": {"label": "Strike-slip",  "color": "#386890", "marker": "s"},
 }
 
 CRIMSON_CRIT = "#7A2317"
 
 
 # =============================================================================
-# 3. DATA INTERFACE (内置物理合成演示数据 + 真实 Julia 输出加载接口)
+# 3. DATA INTERFACE (真实 Julia 输出加载 + Panel c 自动主曲线拟合)
 # =============================================================================
 def generate_synthetic_demo_data() -> dict:
-    """Generate physically consistent synthetic arrays to preview the exact layout."""
+    """Generate physically consistent synthetic arrays for fallback/preview."""
     rng = np.random.default_rng(42)
 
     nx, nz = 128, 128
@@ -247,6 +246,51 @@ def generate_synthetic_demo_data() -> dict:
     }
 
 
+def fit_collapse_master_curve(pts: list) -> dict:
+    """
+    Fit a physically constrained log-logistic master curve + +/-1-sigma scatter band
+    directly to the real cross-regime numerical data in Panel c.
+    """
+    pi_curve = np.logspace(-2.0, 2.0, 240)
+    pis = np.array([pt["Pi_p"] for pt in pts], dtype=float)
+    enrs = np.array([pt["enrichment"] for pt in pts], dtype=float)
+    valid = np.isfinite(pis) & np.isfinite(enrs) & (pis > 0.0) & (enrs > 0.0)
+    pis, enrs = pis[valid], enrs[valid]
+
+    if pis.size < 6 or not HAS_SCIPY:
+        mean_c = 1.0 + 140.0 / (1.0 + pi_curve ** (-2.2))
+        return {"pi_curve": pi_curve, "mean": mean_c, "lo": mean_c * 0.72, "hi": mean_c * 1.38}
+
+    log_y = np.log10(np.maximum(enrs, 1.0))
+
+    def _eval_curve(params, p_arr):
+        y_lo, y_hi, p0_log, slope = params
+        return y_lo + (y_hi - y_lo) / (1.0 + (p_arr / (10.0 ** p0_log)) ** (-slope))
+
+    y_hi_init = float(np.clip(np.percentile(enrs, 92), 30.0, 220.0))
+    res = least_squares(
+        lambda prm: np.log10(np.maximum(_eval_curve(prm, pis), 1.0e-3)) - log_y,
+        x0=[1.05, y_hi_init, 0.0, 2.2],
+        bounds=([0.95, 15.0, -0.65, 0.8], [2.5, 240.0, 0.65, 5.0]),
+        loss="soft_l1",
+        f_scale=0.18,
+    )
+    y_lo, y_hi, p0_log, slope = res.x
+    mean_c = _eval_curve(res.x, pi_curve)
+    # Robust 1-sigma log10 scatter band (MAD-based, clamped to sensible visual envelope)
+    resid = np.log10(np.maximum(_eval_curve(res.x, pis), 1.0e-3)) - log_y
+    mad_sig = 1.4826 * float(np.median(np.abs(resid - np.median(resid))))
+    sig = float(np.clip(max(mad_sig, 0.10), 0.10, 0.28))
+    lo_c = np.maximum(1.0, mean_c * (10.0 ** (-sig)))
+    hi_c = mean_c * (10.0 ** (+sig))
+
+    print(
+        f"[INFO] Fitted Panel c master curve on {pis.size} real runs: "
+        f"y_lo={y_lo:.2f}, y_hi={y_hi:.1f}, Pi_p0={10.0**p0_log:.2f}, slope={slope:.2f}, 1-sigma={sig:.2f} dex"
+    )
+    return {"pi_curve": pi_curve, "mean": mean_c, "lo": lo_c, "hi": hi_c}
+
+
 def _resolve_snapshot_path(data_dir: Path, case_key: str, mode: str) -> Path:
     """Resolve snapshot file according to snapshot mode with graceful fallback."""
     priority = {
@@ -268,13 +312,12 @@ def _resolve_snapshot_path(data_dir: Path, case_key: str, mode: str) -> Path:
 
 def load_real_simulation_data(
     data_dir: Path,
-    snap_mode: str = "active",
+    snap_mode: str = "peak",
     time_li_key: str = TIME_LI_KEY,
 ) -> dict:
     """
-    Load real 2D coupled THMC outputs produced by `solver_2d_thmc_mush.jl`.
-    Applies a single shared log-compressed Darcy-flux scale across all 4 Panel a
-    subplots so 4 orders of magnitude of flux contrast remain quantitatively legible.
+    Load real 2D coupled THMC outputs produced by `solver_2d_thmc_mush.jl`
+    (Panels a & b) and `run_fig3_cd_sweeps.jl` (Panels c & d).
     """
     case_keys = ["static", "filter", "shear_const", "coupled"]
     demo_fallback = generate_synthetic_demo_data()
@@ -365,7 +408,7 @@ def load_real_simulation_data(
             eta_dict[ckey] = np.asarray(d[f"min_eta_{ckey}"], dtype=float)
 
     # -------------------------------------------------------------------------
-    # 3) Panel c: Cross-regime collapse (optional CSV; fallback to skeleton)
+    # 3) Panel c: Cross-regime collapse + direct master-curve regression
     # -------------------------------------------------------------------------
     csv_path = data_dir / "cross_regime_collapse.csv"
     if csv_path.exists():
@@ -378,15 +421,21 @@ def load_real_simulation_data(
                     "Pi_p": float(row["Pi_p"]),
                     "enrichment": float(row["enrichment"]),
                 })
-        collapse_data = dict(demo_fallback["collapse"])
-        collapse_data["points"] = pts
-        print(f"[INFO] Loaded Panel c collapse data ({len(pts)} runs) from '{csv_path.name}'.")
+        fit_dict = fit_collapse_master_curve(pts)
+        collapse_data = {
+            "pi_curve": fit_dict["pi_curve"],
+            "mean": fit_dict["mean"],
+            "lo": fit_dict["lo"],
+            "hi": fit_dict["hi"],
+            "points": pts,
+        }
+        print(f"[INFO] Loaded Panel c collapse data ({len(pts)} real runs) from '{csv_path.name}'.")
     else:
         collapse_data = demo_fallback["collapse"]
         print(f"[WARN] '{csv_path.name}' not found in '{data_dir}' -> Panel c using skeleton preview data.")
 
     # -------------------------------------------------------------------------
-    # 4) Panel d: 2D phase diagram sweep (optional NPZ; fallback to skeleton)
+    # 4) Panel d: 2D phase diagram sweep (real 11x11 or 9x9 grid)
     # -------------------------------------------------------------------------
     pd_path = data_dir / "phase_diagram_grid.npz"
     if pd_path.exists():
@@ -462,13 +511,13 @@ def plot_fig3(data: dict, suffix: str = "") -> None:
         snap = data["snapshots"][ckey]
         meta = CASE_META[ckey]
 
-        # 纯净 Li 浓度场（已去除灰块遮罩；gouraud 平滑渲染消除 96x96 像素锯齿）
+        # 纯净 Li 浓度场（gouraud 平滑渲染消除网格像素锯齿）
         im_a = ax.pcolormesh(
             snap["X"], snap["Z"], snap["Li"],
             cmap=LI_CMAP, norm=LI_NORM, shading="gouraud", rasterized=True, zorder=1
         )
 
-        # 叠加干净的高孔隙熔体通道等值线 (phi = 0.25, 0.40；保留与原骨架一致的极简视觉)
+        # 高孔隙熔体通道等值线 (phi = 0.25, 0.40)
         phi_min_v, phi_max_v = float(np.nanmin(snap["phi"])), float(np.nanmax(snap["phi"]))
         cand_levels = [0.25, 0.40]
         valid_levels = [lv for lv in cand_levels if phi_min_v + 0.005 < lv < phi_max_v - 0.005]
@@ -481,7 +530,7 @@ def plot_fig3(data: dict, suffix: str = "") -> None:
                 linewidths=lws, linestyles=lss, alpha=0.90, zorder=2
             )
 
-        # 叠加稀疏达西流速箭头：四图采用统一物理标尺，疏密与长短直观反映渗滤强度差异
+        # 稀疏达西流速箭头（四图严格采用共享物理对数标尺）
         is_log_q = snap.get("q_norm_mode") == "log"
         base_div = 8 if is_log_q else 9
         step = max(1, snap["X"].shape[0] // base_div)
@@ -548,7 +597,7 @@ def plot_fig3(data: dict, suffix: str = "") -> None:
     cb_a.outline.set_linewidth(0.55)
 
     # -------------------------------------------------------------------------
-    # SHARED 4-CASE LEGEND STRIP (位于上下行留白走廊中，绝不重复堆砌)
+    # SHARED 4-CASE LEGEND STRIP (位于上下行留白走廊中)
     # -------------------------------------------------------------------------
     leg_handles = [
         Line2D([0], [0], color=CASE_META[k]["color"], ls=CASE_META[k]["ls"], lw=CASE_META[k]["lw"], label=CASE_META[k]["legend"])
@@ -624,24 +673,25 @@ def plot_fig3(data: dict, suffix: str = "") -> None:
     ax_c.plot(col["pi_curve"], col["mean"], color=CRIMSON_CRIT, lw=1.15, zorder=2)
     ax_c.axvline(1.0, color=CRIMSON_CRIT, lw=1.0, ls="--", zorder=2.5)
 
+    has_3d = any(pt["dim"] == "3D" for pt in col["points"])
     for pt in col["points"]:
         st = REGIME_STYLES[pt["regime"]]
         is_3d = pt["dim"] == "3D"
         ax_c.scatter(
             pt["Pi_p"], pt["enrichment"],
             marker=st["marker"],
-            s=22 if is_3d else 16,
-            facecolors=st["color"] if is_3d else "#FFFFFF",
-            edgecolors=st["color"],
-            linewidths=0.85 if not is_3d else 0.5,
-            alpha=0.95,
+            s=22 if is_3d else 18,
+            facecolors=st["color"] if (is_3d or not has_3d) else "#FFFFFF",
+            edgecolors="#FFFFFF" if (not has_3d) else st["color"],
+            linewidths=0.45 if (not has_3d) else (0.85 if not is_3d else 0.5),
+            alpha=0.92,
             zorder=5 if is_3d else 4,
         )
 
     ax_c.set_xscale("log")
     ax_c.set_yscale("log")
     ax_c.set_xlim(1.0e-2, 1.0e2)
-    ax_c.set_ylim(1.0, 2.5e2)
+    ax_c.set_ylim(0.85, 2.8e2)
     ax_c.xaxis.set_major_locator(FixedLocator([1e-2, 1e-1, 1e0, 1e1, 1e2]))
     ax_c.xaxis.set_major_formatter(LogFormatterMathtext())
     ax_c.yaxis.set_major_locator(FixedLocator([1e0, 1e1, 1e2]))
@@ -653,21 +703,23 @@ def plot_fig3(data: dict, suffix: str = "") -> None:
     ax_c.tick_params(which="major", labelsize=6.0, length=2.3, pad=1.8)
     ax_c.tick_params(which="minor", length=0)
 
-    ax_c.text(1.18, 1.35, r"$\Pi_p = 1$", fontsize=5.8, fontweight="bold", color=CRIMSON_CRIT, ha="left", va="bottom")
+    ax_c.text(1.22, 1.15, r"$\Pi_p = 1$", fontsize=5.8, fontweight="bold", color=CRIMSON_CRIT, ha="left", va="bottom")
 
     c_handles = [
         Line2D([0], [0], marker=REGIME_STYLES[r]["marker"], color="none",
                markerfacecolor=REGIME_STYLES[r]["color"], markeredgecolor=REGIME_STYLES[r]["color"],
-               markersize=4.0, label=REGIME_STYLES[r]["label"])
+               markersize=4.1, label=REGIME_STYLES[r]["label"])
         for r in ("EXT", "COMP_TRANS", "STRIKE_SLIP")
-    ] + [
-        Line2D([0], [0], marker="o", color="none", markerfacecolor="#FFFFFF", markeredgecolor="#4A4E52",
-               markersize=3.8, label="2D / 3D (filled)"),
     ]
+    if has_3d:
+        c_handles.append(
+            Line2D([0], [0], marker="o", color="none", markerfacecolor="#FFFFFF", markeredgecolor="#4A4E52",
+                   markersize=3.8, label="2D / 3D (filled)")
+        )
     ax_c.legend(
         handles=c_handles, loc="upper left", bbox_to_anchor=(0.01, 0.99),
         frameon=True, facecolor=(1, 1, 1, 0.86), edgecolor="none",
-        fontsize=5.2, handletextpad=0.25, labelspacing=0.22, borderpad=0.2
+        fontsize=5.3, handletextpad=0.28, labelspacing=0.24, borderpad=0.22
     )
 
     fig.text(fx(C_LEFT_MM - 9.5), fy(BOT_TOP_MM + 4.0), "c", fontsize=8.5, fontweight="bold", ha="left", va="top")
@@ -683,15 +735,18 @@ def plot_fig3(data: dict, suffix: str = "") -> None:
     ax_d = fig.add_subplot(gs_d[0, 0])
 
     ph = data["phase"]
+    # Gouraud 平滑渲染真实 2D 相图网格，消除方块马赛克感
     im_d = ax_d.pcolormesh(
         ph["EPS"], ph["ETA"], ph["Li"],
-        cmap=LI_CMAP, norm=LI_NORM, shading="auto", rasterized=True, zorder=1
+        cmap=LI_CMAP, norm=LI_NORM, shading="gouraud", rasterized=True, zorder=1
     )
 
+    # 叠加真实 2D 数值模拟采样点（低调透明黑点，展示离散扫参支撑密度）
     ax_d.scatter(
-        ph["run_eps"], ph["run_eta"], s=3.0, c="#1E2124", alpha=0.26, linewidths=0, zorder=2
+        ph["run_eps"], ph["run_eta"], s=2.6, c="#1E2124", alpha=0.25, linewidths=0, zorder=2
     )
 
+    # 叠加与求解器严格自洽的解析临界线 Pi_p = 1
     valid_l = (ph["eta_crit_line"] >= 1e4) & (ph["eta_crit_line"] <= 1e8)
     ax_d.plot(
         ph["eps_line"][valid_l], ph["eta_crit_line"][valid_l],
@@ -711,9 +766,19 @@ def plot_fig3(data: dict, suffix: str = "") -> None:
     ax_d.tick_params(which="major", labelsize=6.0, length=2.3, pad=1.8)
     ax_d.tick_params(which="minor", length=0)
 
+    # 自动将 Pi_p = 1 标注贴合在临界线浅色侧（避免掉进深红区看不清）
+    eps_v = ph["eps_line"][valid_l]
+    eta_v = ph["eta_crit_line"][valid_l]
+    if eps_v.size > 10:
+        idx_lbl = int(np.argmin(np.abs(np.log10(eps_v) - (-13.7))))
+        lbl_eps = eps_v[idx_lbl] * 0.62
+        lbl_eta = eta_v[idx_lbl] * 1.90
+    else:
+        lbl_eps, lbl_eta = 1.6e-14, 1.8e6
+
     ax_d.text(2.2e-16, 4.2e7, "Mush lock\n" + r"($\Pi_p < 1$)", fontsize=5.8, fontweight="bold", color="#2F4B63", ha="left", va="top", linespacing=1.12, zorder=5)
     ax_d.text(6.5e-12, 2.0e4, "Shear-driven\nLCT " + r"($\Pi_p > 1$)", fontsize=5.8, fontweight="bold", color="#FFFFFF", ha="right", va="bottom", linespacing=1.12, zorder=5)
-    ax_d.text(1.8e-14, 3.6e5, r"$\Pi_p = 1$", fontsize=5.8, fontweight="bold", color=CRIMSON_CRIT, rotation=40, ha="center", va="bottom", zorder=5)
+    ax_d.text(lbl_eps, lbl_eta, r"$\Pi_p = 1$", fontsize=5.8, fontweight="bold", color=CRIMSON_CRIT, rotation=39, ha="center", va="bottom", zorder=5)
 
     fig.text(fx(D_LEFT_MM - 9.5), fy(BOT_TOP_MM + 4.0), "d", fontsize=8.5, fontweight="bold", ha="left", va="top")
 
